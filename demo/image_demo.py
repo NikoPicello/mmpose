@@ -84,11 +84,13 @@ def main():
         model.dataset_meta, skeleton_style=args.skeleton_style)
 
     # inference a single image
-    batch_results = inference_topdown(model, args.img)
+    img = imread(args.img, channel_order='rgb') # [:, :640]
+    # batch_results = inference_topdown(model, args.img)
+    batch_results = inference_topdown(model, img)
     results = merge_data_samples(batch_results)
 
     # show the results
-    img = imread(args.img, channel_order='rgb')
+    # img = imread(args.img, channel_order='rgb')
     visualizer.add_datasample(
         'result',
         img,
