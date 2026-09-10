@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Run demo/rtmo_pipeline.py across many sessions, one per truly-idle GPU.
+"""Run demo/rtmo_pipeline.py across many sessions, packing several onto each GPU.
+
+Sibling of run_parallel_sessions.py -- same staging/cleanup/logging behavior,
+same CLI shape, same resources/ layout. The only difference is the scheduling
+model: instead of claiming a whole GPU per session (one session per idle
+GPU), this script fits up to --max-per-gpu of *our own* sessions onto each
+GPU that has no *other* user's process on it. RTMO is light on VRAM (~450MB
+observed per session against a 24GB card), so a GPU that would otherwise sit
+idle waiting for one session to finish can run several concurrently.
 
 Lives at the mmpose package root (a sibling of demo/, not inside it) and
-invokes demo/rtmo_pipeline.py by relative path from there -- the same
-`python demo/rtmo_pipeline.py ...` invocation shown in rtmo_pipeline.py's own
-docstring, just orchestrated across sessions/GPUs.
+invokes demo/rtmo_pipeline.py by relative path from there, same as
+run_parallel_sessions.py.
 
 Run this from inside the container, from the already-activated mmpose conda
-env (e.g. `python run_parallel_sessions.py ...`) -- each per-session
-subprocess is launched with the same interpreter (sys.executable), not a
-fresh env activation, so the env this script itself runs under is the env
-rtmo_pipeline.py runs under too.
+env (e.g. `python run_packed_sessions.py ...`) -- each per-session subprocess
+is launched with the same interpreter (sys.executable), so the env this
+script itself runs under is the env rtmo_pipeline.py runs under too.
 
-Resource layout (resources/ is located the same way rtmo_pipeline.py finds it
-itself -- by walking up from this file until a resources/sessions dir turns
-up, so this script keeps working regardless of where under pkgs/ it sits):
+Resource layout (same as run_parallel_sessions.py; resources/ is located by
+walking up from this file until a resources/sessions dir turns up):
     resources/all_sessions/<sid>   the full dataset (big, separately-mounted pool)
     resources/sessions/<sid>       local scratch rtmo_pipeline.py actually reads
                                     from; sessions currently staged/in-progress live
@@ -23,54 +28,70 @@ up, so this script keeps working regardless of where under pkgs/ it sits):
                                     already exists is treated as done and skipped
 
 Per session: copy the *entire* session folder (session_data.txt plus every
-activity subfolder -- talk/lego/ghost/animals/gaze) from
-resources/all_sessions/<sid> into resources/sessions/<sid>, atomically (a
-partial/interrupted copy lands in a .tmp path, never mistaken for a
-complete one). Then run `demo/rtmo_pipeline.py --session <sid>` with
-CUDA_VISIBLE_DEVICES pinned to one GPU, and on success remove
-resources/sessions/<sid> entirely (freeing local scratch space). A failed run's
-staged copy is left in place so a re-run picks it up without re-copying.
+activity subfolder -- talk_task/lego_task/ghost_task/animals_task/gaze_task)
+from resources/all_sessions/<sid> into resources/sessions/<sid>, atomically (a
+partial/interrupted copy lands in a .tmp path, never mistaken for a complete
+one). Then run `demo/rtmo_pipeline.py --session <sid>` with CUDA_VISIBLE_DEVICES
+pinned to one GPU, and on success remove resources/sessions/<sid> entirely
+(freeing local scratch space). A failed run's staged copy is left in place so
+a re-run picks it up without re-copying.
 
-Note rtmo_pipeline.py's own --activities default is just ['lego'] (unlike e.g.
-wilor_pipeline.py's --aid, which defaults to every activity) -- if you want
-every activity processed, pass it explicitly via --rtmo-args, e.g.
-`--rtmo-args --activities talk lego ghost animals gaze`. Also note --session is
-a substring match (matching rtmo_pipeline.py's own semantics, shared with
-smpler_pipeline.py) -- session ids passed here should be the full session id
-so they can't accidentally match more than one folder under resources/sessions.
+Note rtmo_pipeline.py's own --activities default is all five real activity
+folder names (animals_task, gaze_task, ghost_task, lego_task, talk_task) --
+NOT the shorter 'lego'/'talk'/etc you might guess from the activity name
+alone; the folders on disk carry the '_task' suffix. Pass --rtmo-args
+--activities explicitly if you only want a subset, e.g. `--rtmo-args
+--activities lego_task`. Also note --session is a substring match, shared
+with rtmo_pipeline.py/smpler_pipeline.py's own semantics -- session ids
+passed here should be the full session id so they can't accidentally match
+more than one folder under resources/sessions.
 
 The already-processed / discovery check below only looks at whether
 resources/rtmo_results/<sid> has *any* output, same coarse granularity as the
-sibling run_parallel_sessions.py scripts -- it does not check that every
+sibling run_parallel_sessions.py script -- it does not check that every
 activity/camera you actually want was extracted. Use rtmo_pipeline.py's own
 --skip-existing flag (forward it via --rtmo-args) if you re-run a session that
 was only partially processed and want it to fill in gaps instead of redoing
 everything.
 
-"Free GPU" means zero processes on it right now (any user, any container --
-checked via `nvidia-smi --query-compute-apps`), not just low utilization. The
-pool re-checks this continuously: as soon as a GPU has no session of ours *and*
-nvidia-smi reports it idle, the next candidate is copied and started on it --
-no waiting for the whole batch to finish. GPUs we've already claimed are
-tracked in-process so a not-yet-CUDA-initialized subprocess can't be
-double-booked during its startup lag.
+Scheduling model ("packing"):
+  A GPU is entirely off-limits the moment ANY process that isn't one of our
+  own tracked session subprocesses shows up on it (any user, any container --
+  checked via `nvidia-smi --query-compute-apps`, cross-referenced against the
+  PIDs of subprocesses we ourselves launched). This mirrors
+  run_parallel_sessions.py's "don't touch a GPU someone else is using"
+  contract -- packing only ever adds more of *our* work onto a GPU, never
+  onto one a stranger is already on.
+
+  Within a GPU that passes that check, up to --max-per-gpu of our own
+  sessions may run concurrently on it. A further --min-free-mib floor on
+  nvidia-smi's reported free memory gates each additional session, so a GPU
+  that's already packed tighter than expected (bigger videos, more people in
+  frame, etc.) doesn't get pushed into an OOM.
+
+  GPUs we've already claimed slots on are tracked in-process (a per-GPU
+  count, not just a set) so a not-yet-CUDA-initialized subprocess can't be
+  over-booked during its startup lag, the same concern
+  run_parallel_sessions.py's single-slot version has.
 
 With explicit session ids on the command line, the candidate list is fixed and
 the script exits once they're all done. With no ids, it auto-discovers
 candidates from resources/all_sessions and keeps re-scanning for newly
-arrived ones, so it runs indefinitely (Ctrl-C to stop; a session already
-mid-run finishes before the process exits).
+arrived ones, so it runs indefinitely (Ctrl-C to stop; sessions already
+mid-run finish before the process exits).
 
 Usage:
-    python run_parallel_sessions.py                  # watch all_sessions forever
-    python run_parallel_sessions.py 000000 004096     # just these, then exit
-    python run_parallel_sessions.py --gpus 0,1,2,3    # restrict the GPU whitelist
-    python run_parallel_sessions.py --rtmo-args --activities talk lego ghost animals gaze
-    python run_parallel_sessions.py --dry-run          # log planned actions only
+    python run_packed_sessions.py                        # watch all_sessions forever
+    python run_packed_sessions.py 000000 004096           # just these, then exit
+    python run_packed_sessions.py --gpus 2,3,4,5           # restrict the GPU whitelist
+    python run_packed_sessions.py --max-per-gpu 6           # pack up to 6 sessions/GPU
+    python run_packed_sessions.py --min-free-mib 3000        # bigger safety margin
+    python run_packed_sessions.py --rtmo-args --activities talk_task lego_task ghost_task animals_task gaze_task
+    python run_packed_sessions.py --dry-run                   # log planned actions only
 
 --rtmo-args grabs every token after it (argparse REMAINDER), so it must come
 LAST -- session ids or other flags after it are swallowed as rtmo_pipeline.py
-args instead. Put session ids first: `... 000000 004096 --rtmo-args --activities lego`.
+args instead. Put session ids first: `... 000000 004096 --rtmo-args --activities lego_task`.
 
 Logs: ./run_logs/<run_id>/<session_id>.log (one per session attempt), plus a
 summary.tsv of "<session_id>\t<exit_code>" lines.
@@ -114,32 +135,44 @@ SESSIONS_DIR = RESOURCES_DIR / "sessions"
 RTMO_RESULTS_DIR = RESOURCES_DIR / "rtmo_results"
 
 DEFAULT_POLL_INTERVAL = 15.0
+DEFAULT_MAX_PER_GPU = 4
+DEFAULT_MIN_FREE_MIB = 5000
 
 
-def free_gpu_indices(whitelist: set[int] | None = None) -> list[int]:
-    """GPU indices with zero processes right now (any user), via nvidia-smi."""
+def gpu_status(whitelist: set[int] | None, own_pids: set[int]) -> dict[int, int]:
+    """Free-memory (MiB) per GPU index that is safe for us to add more of our
+    own sessions to -- i.e. has zero processes that aren't one of `own_pids`.
+    A GPU with any foreign process is omitted entirely (never a candidate)."""
     try:
         gpus_out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,uuid,memory.free", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=True, timeout=15,
         ).stdout
         apps_out = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
             capture_output=True, text=True, check=True, timeout=15,
         ).stdout
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         raise SystemExit(f"nvidia-smi query failed: {e}") from e
 
-    busy_uuids = {line.strip() for line in apps_out.strip().splitlines() if line.strip()}
-    free = []
+    foreign_uuids: set[str] = set()
+    for line in apps_out.strip().splitlines():
+        if not line.strip():
+            continue
+        pid_s, uuid = (p.strip() for p in line.split(",", 1))
+        if int(pid_s) not in own_pids:
+            foreign_uuids.add(uuid)
+
+    free_mib: dict[int, int] = {}
     for line in gpus_out.strip().splitlines():
-        idx_s, uuid = (p.strip() for p in line.split(",", 1))
+        idx_s, uuid, free_s = (p.strip() for p in line.split(",", 2))
         idx = int(idx_s)
         if whitelist is not None and idx not in whitelist:
             continue
-        if uuid not in busy_uuids:
-            free.append(idx)
-    return sorted(free)
+        if uuid in foreign_uuids:
+            continue
+        free_mib[idx] = int(free_s)
+    return free_mib
 
 
 def already_processed(sid: str) -> bool:
@@ -155,13 +188,17 @@ def discover_candidates(known: set[str]) -> list[str]:
 
 
 class Runner:
-    def __init__(self, log_dir: Path, rtmo_args: list[str], dry_run: bool):
+    def __init__(self, log_dir: Path, rtmo_args: list[str], dry_run: bool,
+                max_per_gpu: int, min_free_mib: int):
         self.log_dir = log_dir
         self.rtmo_args = rtmo_args
         self.dry_run = dry_run
+        self.max_per_gpu = max_per_gpu
+        self.min_free_mib = min_free_mib
 
         self.lock = threading.Lock()
-        self.active_gpus: set[int] = set()
+        self.gpu_counts: dict[int, int] = {}   # gpu -> count of our active sessions on it
+        self.own_pids: set[int] = set()        # PIDs of subprocesses we've launched (still running)
         self.threads: list[threading.Thread] = []
         self.summary: list[tuple[str, int]] = []
 
@@ -221,9 +258,18 @@ class Runner:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         log_fh.flush()
-        proc = subprocess.run(cmd, cwd=str(RTMO_ROOT), env=env,
-                              stdout=log_fh, stderr=subprocess.STDOUT)
-        return proc.returncode
+        # Popen (not run) so the PID is known immediately -- it needs to be
+        # registered in own_pids right away, before nvidia-smi has any chance
+        # to see this process's CUDA context and (mis)classify it as foreign.
+        proc = subprocess.Popen(cmd, cwd=str(RTMO_ROOT), env=env,
+                                stdout=log_fh, stderr=subprocess.STDOUT)
+        with self.lock:
+            self.own_pids.add(proc.pid)
+        try:
+            return proc.wait()
+        finally:
+            with self.lock:
+                self.own_pids.discard(proc.pid)
 
     def _worker(self, sid: str, gpu: int) -> None:
         print(f"[{sid}] starting on GPU {gpu} (log: {self._log_path(sid)})")
@@ -252,18 +298,42 @@ class Runner:
                       f"left staged in {SESSIONS_DIR} for retry", file=sys.stderr)
         finally:
             with self.lock:
-                self.active_gpus.discard(gpu)
+                self.gpu_counts[gpu] -= 1
+                if self.gpu_counts[gpu] <= 0:
+                    del self.gpu_counts[gpu]
 
     def launch(self, sid: str, gpu: int) -> None:
         with self.lock:
-            self.active_gpus.add(gpu)
+            self.gpu_counts[gpu] = self.gpu_counts.get(gpu, 0) + 1
         t = threading.Thread(target=self._worker, args=(sid, gpu), daemon=True)
         t.start()
         self.threads.append(t)
 
-    def active_snapshot(self) -> set[int]:
+    def snapshot(self) -> tuple[dict[int, int], set[int]]:
         with self.lock:
-            return set(self.active_gpus)
+            return dict(self.gpu_counts), set(self.own_pids)
+
+    def slots(self, whitelist: set[int] | None) -> list[int]:
+        """GPU indices with a free packing slot right now, one entry per open
+        slot (a GPU with 3 of --max-per-gpu 4 used and enough free memory
+        appears once; a fully-idle one with plenty of memory could appear
+        --max-per-gpu times)."""
+        counts, own_pids = self.snapshot()
+        free_mib = gpu_status(whitelist, own_pids)
+        out: list[int] = []
+        for gpu, mib in free_mib.items():
+            used = counts.get(gpu, 0)
+            open_slots = self.max_per_gpu - used
+            if open_slots <= 0:
+                continue
+            # Each additional session needs its own min_free_mib headroom;
+            # nvidia-smi's free memory already reflects sessions that have
+            # actually allocated, but not ones still starting up (CUDA init
+            # lag) -- gpu_counts (in-process) is what protects against that,
+            # this is just an extra floor against under-estimating usage.
+            fit_by_mem = mib // self.min_free_mib
+            out.extend([gpu] * max(0, min(open_slots, fit_by_mem)))
+        return out
 
     def join_all(self) -> None:
         for t in self.threads:
@@ -272,24 +342,34 @@ class Runner:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Run rtmo_pipeline.py across sessions, one per idle GPU.")
+        description="Run rtmo_pipeline.py across sessions, packing several per GPU.")
     ap.add_argument("sessions", nargs="*",
                     help="explicit session ids to run (default: auto-discover from "
                          "resources/all_sessions, re-scanning forever)")
     ap.add_argument("--gpus", default=os.environ.get("GPUS"),
                     help="comma-separated GPU index whitelist (default: all GPUs "
-                         "reported by nvidia-smi). Still only used when actually idle.")
+                         "reported by nvidia-smi). Still skipped entirely whenever "
+                         "another user's process is on it.")
+    ap.add_argument("--max-per-gpu", type=int, default=DEFAULT_MAX_PER_GPU,
+                    help=f"max concurrent sessions of ours packed onto one GPU "
+                         f"(default: {DEFAULT_MAX_PER_GPU})")
+    ap.add_argument("--min-free-mib", type=int, default=DEFAULT_MIN_FREE_MIB,
+                    help=f"required free GPU memory (MiB) per additional packed "
+                         f"session (default: {DEFAULT_MIN_FREE_MIB})")
     ap.add_argument("--rtmo-args", nargs=argparse.REMAINDER, default=[],
                     help="remaining args forwarded to rtmo_pipeline.py, e.g. "
-                         "--activities talk lego --skip-existing. Must be LAST on the "
-                         "command line -- it swallows everything after it, including "
-                         "session ids.")
+                         "--activities talk_task lego_task --skip-existing. Must be "
+                         "LAST on the command line -- it swallows everything after "
+                         "it, including session ids.")
     ap.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help=f"seconds between nvidia-smi/candidate re-checks (default: "
                          f"{DEFAULT_POLL_INTERVAL})")
     ap.add_argument("--dry-run", action="store_true",
                     help="log planned copy/run/remove actions without doing them")
     args = ap.parse_args()
+
+    if args.max_per_gpu < 1:
+        raise SystemExit("--max-per-gpu must be >= 1")
 
     whitelist = None
     if args.gpus:
@@ -301,6 +381,8 @@ def main() -> int:
     log_dir = RTMO_ROOT / "run_logs" / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"logs: {log_dir}/<session_id>.log")
+    print(f"packing: up to {args.max_per_gpu} sessions/GPU, "
+          f"{args.min_free_mib} MiB free required per additional session")
 
     explicit = bool(args.sessions)
     known: set[str] = set()
@@ -315,10 +397,11 @@ def main() -> int:
         print(f"auto-discovery mode: watching {ALL_SESSIONS_DIR} forever "
               f"(Ctrl-C to stop)")
 
-    runner = Runner(log_dir, args.rtmo_args, args.dry_run)
+    runner = Runner(log_dir, args.rtmo_args, args.dry_run,
+                    args.max_per_gpu, args.min_free_mib)
 
     try:
-        while candidates or runner.active_snapshot() or not explicit:
+        while candidates or runner.snapshot()[0] or not explicit:
             if not explicit:
                 new = discover_candidates(known)
                 if new:
@@ -326,9 +409,7 @@ def main() -> int:
                     candidates.extend(new)
                     known.update(new)
 
-            active = runner.active_snapshot()
-            usable = [g for g in free_gpu_indices(whitelist) if g not in active]
-            for gpu in usable:
+            for gpu in runner.slots(whitelist):
                 if not candidates:
                     break
                 runner.launch(candidates.popleft(), gpu)

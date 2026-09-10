@@ -311,9 +311,9 @@ def main():
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument('--session', default='005013',
                       help="session id substring to process, or 'all' (default: 005013)")
-  parser.add_argument('--activities', nargs='+', default=['lego'],
-                      help='activities to process (default: lego)')
-  parser.add_argument('--max-frames', type=int, default=50,
+  parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'],
+                      help='activities to process (default: all five)')
+  parser.add_argument('--max-frames', type=int, default=-1,
                       help='cap frames per video; -1 for the whole video (default: 50)')
   parser.add_argument('--kpt-thr', type=float, default=0.0,
                       help='keypoints below this confidence are saved as NaN (default: 0.0 = keep all)')
