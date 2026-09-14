@@ -26,18 +26,17 @@ Per session: copy the *entire* session folder (session_data.txt plus every
 activity subfolder -- talk/lego/ghost/animals/gaze) from
 resources/all_sessions/<sid> into resources/sessions/<sid>, atomically (a
 partial/interrupted copy lands in a .tmp path, never mistaken for a
-complete one). Then run `demo/rtmo_pipeline.py --session <sid>` with
+complete one). Then run `demo/rtmo_pipeline.py --sid <sid>` with
 CUDA_VISIBLE_DEVICES pinned to one GPU, and on success remove
 resources/sessions/<sid> entirely (freeing local scratch space). A failed run's
 staged copy is left in place so a re-run picks it up without re-copying.
 
-Note rtmo_pipeline.py's own --activities default is just ['lego'] (unlike e.g.
-wilor_pipeline.py's --aid, which defaults to every activity) -- if you want
-every activity processed, pass it explicitly via --rtmo-args, e.g.
-`--rtmo-args --activities talk lego ghost animals gaze`. Also note --session is
-a substring match (matching rtmo_pipeline.py's own semantics, shared with
-smpler_pipeline.py) -- session ids passed here should be the full session id
-so they can't accidentally match more than one folder under resources/sessions.
+rtmo_pipeline.py's own --activities default is every activity (matching
+wilor_pipeline.py/smpler_pipeline.py/sam_pipeline.py/3ddfa_pipeline.py); narrow
+it via --rtmo-args, e.g. `--rtmo-args --activities lego_task`. Also note --sid is
+a substring match (matching rtmo_pipeline.py's own semantics, shared with the
+other pipelines) -- session ids passed here should be the full session id so
+they can't accidentally match more than one folder under resources/sessions.
 
 The already-processed / discovery check below only looks at whether
 resources/rtmo_results/<sid> has *any* output, same coarse granularity as the
@@ -65,12 +64,12 @@ Usage:
     python run_parallel_sessions.py                  # watch all_sessions forever
     python run_parallel_sessions.py 000000 004096     # just these, then exit
     python run_parallel_sessions.py --gpus 0,1,2,3    # restrict the GPU whitelist
-    python run_parallel_sessions.py --rtmo-args --activities talk lego ghost animals gaze
+    python run_parallel_sessions.py --rtmo-args --activities lego_task
     python run_parallel_sessions.py --dry-run          # log planned actions only
 
 --rtmo-args grabs every token after it (argparse REMAINDER), so it must come
 LAST -- session ids or other flags after it are swallowed as rtmo_pipeline.py
-args instead. Put session ids first: `... 000000 004096 --rtmo-args --activities lego`.
+args instead. Put session ids first: `... 000000 004096 --rtmo-args --activities lego_task`.
 
 Logs: ./run_logs/<run_id>/<session_id>.log (one per session attempt), plus a
 summary.tsv of "<session_id>\t<exit_code>" lines.
@@ -114,6 +113,11 @@ SESSIONS_DIR = RESOURCES_DIR / "sessions"
 RTMO_RESULTS_DIR = RESOURCES_DIR / "rtmo_results"
 
 DEFAULT_POLL_INTERVAL = 15.0
+# Gap between consecutive launches. With nvidia-persistenced off (persistence mode
+# Disabled), the first client onto a cold GPU triggers a full driver init; several jobs
+# doing that at the same instant contend and some fail with CUDA_ERROR_NOT_INITIALIZED,
+# silently falling back to CPU. Staggering lets them serialise.
+DEFAULT_LAUNCH_STAGGER = 15.0
 
 
 def free_gpu_indices(whitelist: set[int] | None = None) -> list[int]:
@@ -213,7 +217,7 @@ class Runner:
         # no env activation/wrapping happens here. Invoked as demo/rtmo_pipeline.py
         # (cwd is RTMO_ROOT, the mmpose package root) since this orchestrator lives
         # alongside demo/, not inside it.
-        cmd = [sys.executable, "demo/rtmo_pipeline.py", "--session", sid, *self.rtmo_args]
+        cmd = [sys.executable, "demo/rtmo_pipeline.py", "--sid", sid, *self.rtmo_args]
         print(f"[{sid}] running: {' '.join(cmd)} (CUDA_VISIBLE_DEVICES={gpu})", file=log_fh)
         if self.dry_run:
             print(f"[{sid}] DRY-RUN: skipping actual run", file=log_fh)
@@ -281,9 +285,25 @@ def main() -> int:
                          "reported by nvidia-smi). Still only used when actually idle.")
     ap.add_argument("--rtmo-args", nargs=argparse.REMAINDER, default=[],
                     help="remaining args forwarded to rtmo_pipeline.py, e.g. "
-                         "--activities talk lego --skip-existing. Must be LAST on the "
+                         "--activities lego_task --skip-existing. Must be LAST on the "
                          "command line -- it swallows everything after it, including "
                          "session ids.")
+    ap.add_argument("--no-gpu-check", action="store_true",
+                    help="trust --gpus as-is: use exactly those GPUs and never run "
+                         "nvidia-smi. Requires --gpus. Use when you've already checked "
+                         "they're free (nvitop) and the nvidia-smi probe is stalling "
+                         "under load. Note this drops the guard against taking a GPU "
+                         "another user grabs mid-run.")
+    ap.add_argument("--use-video", action="store_true",
+                    help="forward --use_video to rtmo_pipeline.py, reading *.mp4 "
+                         "directly instead of the default pre-extracted frame folders "
+                         "(see ../../../scripts/extract_frames.py).")
+    ap.add_argument("--launch-stagger", type=float, default=DEFAULT_LAUNCH_STAGGER,
+                    help=f"seconds to wait between consecutive session launches "
+                         f"(default: {DEFAULT_LAUNCH_STAGGER}). Persistence mode is off on "
+                         f"this node, so the first job onto a cold GPU pays a slow driver "
+                         f"init; launching several at once makes them collide and fall back "
+                         f"to CPU. 0 disables.")
     ap.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help=f"seconds between nvidia-smi/candidate re-checks (default: "
                          f"{DEFAULT_POLL_INTERVAL})")
@@ -294,6 +314,13 @@ def main() -> int:
     whitelist = None
     if args.gpus:
         whitelist = {int(g) for g in args.gpus.replace(",", " ").split()}
+    if args.no_gpu_check:
+        if not whitelist:
+            raise SystemExit("--no-gpu-check requires --gpus (e.g. --gpus 3,4,5,6)")
+        print(f"--no-gpu-check: using GPUs {sorted(whitelist)} as given, "
+              f"no nvidia-smi probing")
+    if args.use_video:
+        args.rtmo_args = [*args.rtmo_args, "--use_video"]
 
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -327,11 +354,14 @@ def main() -> int:
                     known.update(new)
 
             active = runner.active_snapshot()
-            usable = [g for g in free_gpu_indices(whitelist) if g not in active]
+            pool = sorted(whitelist) if args.no_gpu_check else free_gpu_indices(whitelist)
+            usable = [g for g in pool if g not in active]
             for gpu in usable:
                 if not candidates:
                     break
                 runner.launch(candidates.popleft(), gpu)
+                if candidates and args.launch_stagger > 0 and not args.dry_run:
+                    time.sleep(args.launch_stagger)
 
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:

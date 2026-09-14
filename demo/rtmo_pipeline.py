@@ -31,7 +31,7 @@ Each <cam>_rtmo.npy is a list of length n_frames; element fidx is::
     ... }
 
 Run (in the `mmpose` env):
-  python demo/rtmo_pipeline.py --session 005013 --activities lego
+  python demo/rtmo_pipeline.py --sid 005013 --activities lego_task
 """
 
 import os
@@ -217,10 +217,13 @@ def draw_pose(frame, kpts, scores, color, kpt_thr=0.01):
 # ---------------------------------------------------------------------------
 # Per-video extraction.
 # ---------------------------------------------------------------------------
-def extract_video(inferencer, vid_path, cam_id, out_npy_path, max_frames,
-                  kpt_thr, vis_dir=None, vis_every=0, top_margin=0.0, upper_thr=0.0):
-  """Run RTMO over one camera video and save per-person 2D keypoints.
+def extract_video(inferencer, data_path, cam_id, out_npy_path, max_frames,
+                  kpt_thr, use_video, vis_dir=None, vis_every=0, top_margin=0.0, upper_thr=0.0):
+  """Run RTMO over one camera's frames and save per-person 2D keypoints.
 
+  data_path  : a *.mp4 file when use_video, else a folder of that camera's
+               extracted frames (000000.jpeg, 000001.jpeg, ... from
+               ../../../scripts/extract_frames.py).
   kpt_thr    : keypoints with confidence below this are written as NaN (their
                score is still kept) so the triangulator drops them; 0.0 keeps all.
   top_margin : fraction of the frame height to black out at the top before
@@ -233,8 +236,12 @@ def extract_video(inferencer, vid_path, cam_id, out_npy_path, max_frames,
                below this, to reject a background person whose head/shoulders are
                not in frame (0.0 = off).
   """
-  cap = cv.VideoCapture(vid_path)
-  total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+  if use_video:
+    cap = cv.VideoCapture(data_path)
+    total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+  else:
+    image_paths = sorted(glob.glob(osp.join(data_path, '*.jpeg')))
+    total = len(image_paths)
   if max_frames is not None:
     total = min(total, max_frames)
 
@@ -242,9 +249,15 @@ def extract_video(inferencer, vid_path, cam_id, out_npy_path, max_frames,
 
   out_results = []
   for fidx in trange(total, desc=cam_id, leave=False):
-    ret, frame = cap.read()
-    if not ret:
-      break
+    if use_video:
+      ret, frame = cap.read()
+      if not ret:
+        break
+    else:
+      frame = cv.imread(image_paths[fidx])
+      if frame is None:
+        print(f'  [warn] unreadable frame, skipping: {image_paths[fidx]}')
+        continue
     if frame.shape[1] != FRAME_W or frame.shape[0] != FRAME_H:
       frame = cv.resize(frame, (FRAME_W, FRAME_H))
     if mask_rows:
@@ -284,7 +297,8 @@ def extract_video(inferencer, vid_path, cam_id, out_npy_path, max_frames,
                    0.6, PERSON_COLOR.get(pid, (255, 255, 255)), 2)
       cv.imwrite(os.path.join(vis_dir, f'f{fidx:06d}.jpg'), canvas)
 
-  cap.release()
+  if use_video:
+    cap.release()
   np.save(out_npy_path, np.array(out_results, dtype=object))
   return len(out_results)
 
@@ -309,12 +323,15 @@ def pick_device(requested):
 def main():
   parser = argparse.ArgumentParser(description=__doc__,
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument('--session', default='005013',
-                      help="session id substring to process, or 'all' (default: 005013)")
+  parser.add_argument('--sid', default=None,
+                      help="session id substring to process (default: all sessions)")
   parser.add_argument('--activities', nargs='+', default=['animals_task', 'gaze_task', 'ghost_task', 'lego_task', 'talk_task'],
                       help='activities to process (default: all five)')
   parser.add_argument('--max-frames', type=int, default=-1,
-                      help='cap frames per video; -1 for the whole video (default: 50)')
+                      help='cap frames per video; -1 for the whole video (default: -1)')
+  parser.add_argument('--use_video', action='store_true',
+                      help='read *.mp4 directly; default reads pre-extracted frame '
+                           'folders from ../../../scripts/extract_frames.py')
   parser.add_argument('--kpt-thr', type=float, default=0.0,
                       help='keypoints below this confidence are saved as NaN (default: 0.0 = keep all)')
   parser.add_argument('--top-margin', type=float, default=0.,
@@ -361,25 +378,27 @@ def main():
   sid_paths = sorted(glob.glob(sessions_path + '/*'))
   for sid_path in sid_paths:
     session_id = Path(sid_path).stem
-    if args.session != 'all' and args.session not in session_id:
+    if args.sid is not None and args.sid not in session_id:
       continue
     log_file.write(f'{session_id}\n'); log_file.flush()
 
     for activity in args.activities:
-      vid_paths = glob.glob(osp.join(sid_path, activity) + '/*')
-      # E1/E2 are auxiliary (non-calibrated) streams — skip like smpler_pipeline.
-      vid_paths = [v for v in vid_paths if not ('E1.mp4' in v or 'E2.mp4' in v)]
-      vid_paths = sorted(v for v in vid_paths if v.endswith('.mp4'))
-      if not vid_paths:
+      if args.use_video:
+        data_paths = glob.glob(osp.join(sid_path, activity, '*.mp4'))
+        # E1/E2 are auxiliary (non-calibrated) streams — skip like smpler_pipeline.
+        data_paths = sorted(v for v in data_paths if not ('E1.mp4' in v or 'E2.mp4' in v))
+      else:
+        data_paths = sorted(p for p in glob.glob(osp.join(sid_path, activity) + '/*') if osp.isdir(p))
+      if not data_paths:
         continue
-      print(f'Processing {activity} in session {session_id} ({len(vid_paths)} cams)')
+      print(f'Processing {activity} in session {session_id} ({len(data_paths)} cams)')
       log_file.write(f'\t{activity}\n'); log_file.flush()
 
       curr_out = osp.join(out_root, session_id, activity)
       os.makedirs(curr_out, exist_ok=True)
 
-      for vid_path in vid_paths:
-        cam_id = Path(vid_path).stem
+      for data_path in data_paths:
+        cam_id = Path(data_path).stem
         if cam_id not in SPATIAL_REGIONS:
           print(f'  [skip] {cam_id}: no spatial region defined')
           continue
@@ -393,9 +412,9 @@ def main():
           vis_dir = osp.join(log_dir, session_id, activity, cam_id)
           os.makedirs(vis_dir, exist_ok=True)
         try:
-          n = extract_video(inferencer, vid_path, cam_id, out_npy_path,
-                            max_frames, args.kpt_thr, vis_dir, args.vis_every,
-                            args.top_margin, args.upper_thr)
+          n = extract_video(inferencer, data_path, cam_id, out_npy_path,
+                            max_frames, args.kpt_thr, args.use_video, vis_dir,
+                            args.vis_every, args.top_margin, args.upper_thr)
           print(f'  {cam_id} ---> OK! ({n} frames)')
           log_file.write(f'\t\t{cam_id} ---> OK! ({n} frames)\n'); log_file.flush()
         except Exception as e:

@@ -31,7 +31,7 @@ Per session: copy the *entire* session folder (session_data.txt plus every
 activity subfolder -- talk_task/lego_task/ghost_task/animals_task/gaze_task)
 from resources/all_sessions/<sid> into resources/sessions/<sid>, atomically (a
 partial/interrupted copy lands in a .tmp path, never mistaken for a complete
-one). Then run `demo/rtmo_pipeline.py --session <sid>` with CUDA_VISIBLE_DEVICES
+one). Then run `demo/rtmo_pipeline.py --sid <sid>` with CUDA_VISIBLE_DEVICES
 pinned to one GPU, and on success remove resources/sessions/<sid> entirely
 (freeing local scratch space). A failed run's staged copy is left in place so
 a re-run picks it up without re-copying.
@@ -41,7 +41,7 @@ folder names (animals_task, gaze_task, ghost_task, lego_task, talk_task) --
 NOT the shorter 'lego'/'talk'/etc you might guess from the activity name
 alone; the folders on disk carry the '_task' suffix. Pass --rtmo-args
 --activities explicitly if you only want a subset, e.g. `--rtmo-args
---activities lego_task`. Also note --session is a substring match, shared
+--activities lego_task`. Also note --sid is a substring match, shared
 with rtmo_pipeline.py/smpler_pipeline.py's own semantics -- session ids
 passed here should be the full session id so they can't accidentally match
 more than one folder under resources/sessions.
@@ -86,6 +86,7 @@ Usage:
     python run_packed_sessions.py --gpus 2,3,4,5           # restrict the GPU whitelist
     python run_packed_sessions.py --max-per-gpu 6           # pack up to 6 sessions/GPU
     python run_packed_sessions.py --min-free-mib 3000        # bigger safety margin
+    python run_packed_sessions.py --use-video                # read *.mp4 instead of extracted frames
     python run_packed_sessions.py --rtmo-args --activities talk_task lego_task ghost_task animals_task gaze_task
     python run_packed_sessions.py --dry-run                   # log planned actions only
 
@@ -137,6 +138,13 @@ RTMO_RESULTS_DIR = RESOURCES_DIR / "rtmo_results"
 DEFAULT_POLL_INTERVAL = 15.0
 DEFAULT_MAX_PER_GPU = 4
 DEFAULT_MIN_FREE_MIB = 5000
+# Gap between consecutive launches. With nvidia-persistenced off (persistence mode
+# Disabled), the first client onto a cold GPU triggers a full driver init; several jobs
+# doing that at the same instant contend and some fail with CUDA_ERROR_NOT_INITIALIZED,
+# silently falling back to CPU. Staggering lets them serialise. Applies to any launch,
+# not just a GPU's first slot -- packing several sessions onto one GPU in the same tick
+# hits the same contention if that GPU itself is still cold.
+DEFAULT_LAUNCH_STAGGER = 15.0
 
 
 def gpu_status(whitelist: set[int] | None, own_pids: set[int]) -> dict[int, int]:
@@ -250,7 +258,7 @@ class Runner:
         # no env activation/wrapping happens here. Invoked as demo/rtmo_pipeline.py
         # (cwd is RTMO_ROOT, the mmpose package root) since this orchestrator lives
         # alongside demo/, not inside it.
-        cmd = [sys.executable, "demo/rtmo_pipeline.py", "--session", sid, *self.rtmo_args]
+        cmd = [sys.executable, "demo/rtmo_pipeline.py", "--sid", sid, *self.rtmo_args]
         print(f"[{sid}] running: {' '.join(cmd)} (CUDA_VISIBLE_DEVICES={gpu})", file=log_fh)
         if self.dry_run:
             print(f"[{sid}] DRY-RUN: skipping actual run", file=log_fh)
@@ -361,6 +369,16 @@ def main() -> int:
                          "--activities talk_task lego_task --skip-existing. Must be "
                          "LAST on the command line -- it swallows everything after "
                          "it, including session ids.")
+    ap.add_argument("--use-video", action="store_true",
+                    help="forward --use_video to rtmo_pipeline.py, reading *.mp4 "
+                         "directly instead of the default pre-extracted frame folders "
+                         "(see ../../../scripts/extract_frames.py).")
+    ap.add_argument("--launch-stagger", type=float, default=DEFAULT_LAUNCH_STAGGER,
+                    help=f"seconds to wait between consecutive session launches "
+                         f"(default: {DEFAULT_LAUNCH_STAGGER}). Persistence mode is off on "
+                         f"this node, so the first job onto a cold GPU pays a slow driver "
+                         f"init; launching several at once makes them collide and fall back "
+                         f"to CPU. 0 disables.")
     ap.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL,
                     help=f"seconds between nvidia-smi/candidate re-checks (default: "
                          f"{DEFAULT_POLL_INTERVAL})")
@@ -374,6 +392,8 @@ def main() -> int:
     whitelist = None
     if args.gpus:
         whitelist = {int(g) for g in args.gpus.replace(",", " ").split()}
+    if args.use_video:
+        args.rtmo_args = [*args.rtmo_args, "--use_video"]
 
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -413,6 +433,8 @@ def main() -> int:
                 if not candidates:
                     break
                 runner.launch(candidates.popleft(), gpu)
+                if candidates and args.launch_stagger > 0 and not args.dry_run:
+                    time.sleep(args.launch_stagger)
 
             time.sleep(args.poll_interval)
     except KeyboardInterrupt:
