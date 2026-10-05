@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run demo/rtmo_pipeline.py across many sessions, packing several onto each GPU.
+"""Run rtmo_pipeline.py across many sessions, packing several onto each GPU.
 
 Sibling of run_parallel_sessions.py -- same staging/cleanup/logging behavior,
 same CLI shape, same resources/ layout. The only difference is the scheduling
@@ -9,8 +9,8 @@ GPU that has no *other* user's process on it. RTMO is light on VRAM (~450MB
 observed per session against a 24GB card), so a GPU that would otherwise sit
 idle waiting for one session to finish can run several concurrently.
 
-Lives at the mmpose package root (a sibling of demo/, not inside it) and
-invokes demo/rtmo_pipeline.py by relative path from there, same as
+Lives at the mmpose package root, next to rtmo_pipeline.py, and
+invokes rtmo_pipeline.py by relative path from there, same as
 run_parallel_sessions.py.
 
 Run this from inside the container, from the already-activated mmpose conda
@@ -31,7 +31,7 @@ Per session: copy the *entire* session folder (session_data.txt plus every
 activity subfolder -- talk_task/lego_task/ghost_task/animals_task/gaze_task)
 from resources/all_sessions/<sid> into resources/sessions/<sid>, atomically (a
 partial/interrupted copy lands in a .tmp path, never mistaken for a complete
-one). Then run `demo/rtmo_pipeline.py --sid <sid>` with CUDA_VISIBLE_DEVICES
+one). Then run `rtmo_pipeline.py --sid <sid>` with CUDA_VISIBLE_DEVICES
 pinned to one GPU, and on success remove resources/sessions/<sid> entirely
 (freeing local scratch space). A failed run's staged copy is left in place so
 a re-run picks it up without re-copying.
@@ -255,10 +255,10 @@ class Runner:
     def _run_pipeline(self, sid: str, gpu: int, log_fh) -> int:
         # Uses the same interpreter this orchestrator is running under (sys.executable),
         # so it must itself already be launched from the right conda env's python --
-        # no env activation/wrapping happens here. Invoked as demo/rtmo_pipeline.py
-        # (cwd is RTMO_ROOT, the mmpose package root) since this orchestrator lives
-        # alongside demo/, not inside it.
-        cmd = [sys.executable, "demo/rtmo_pipeline.py", "--sid", sid, *self.rtmo_args]
+        # no env activation/wrapping happens here. Invoked as rtmo_pipeline.py
+        # (cwd is RTMO_ROOT, the mmpose package root; this orchestrator lives
+        # alongside it).
+        cmd = [sys.executable, "rtmo_pipeline.py", "--sid", sid, *self.rtmo_args]
         print(f"[{sid}] running: {' '.join(cmd)} (CUDA_VISIBLE_DEVICES={gpu})", file=log_fh)
         if self.dry_run:
             print(f"[{sid}] DRY-RUN: skipping actual run", file=log_fh)
